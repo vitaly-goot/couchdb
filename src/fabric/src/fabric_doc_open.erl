@@ -50,9 +50,9 @@ go(DbName, Id, Options) ->
     },
     RexiMon = fabric_util:create_monitors(Workers),
     try fabric_util:recv(Workers, #shard.ref, fun handle_message/3, Acc0) of
-    {ok, #acc{}=Acc} when Handler =:= open_doc ->
-        Reply = handle_response(Acc),
-        format_reply(Reply, SuppressDeletedDoc);
+    %{ok, #acc{}=Acc} when Handler =:= open_doc ->
+    %    Reply = handle_response(Acc),
+    %    format_reply(Reply, SuppressDeletedDoc);
     {ok, #acc{state = r_not_met}} ->
         {error, quorum_not_met};
     {ok, #acc{q_reply = QuorumReply}} ->
