@@ -12,7 +12,7 @@
 
 -module(couch_mrview_updater).
 
--export([start_update/4, purge/4, process_doc/3, finish_update/1]).
+-export([start_update/4, start_update/5, purge/4, process_doc/3, finish_update/1]).
 
 -include_lib("couch/include/couch_db.hrl").
 -include_lib("couch_mrview/include/couch_mrview.hrl").
@@ -20,6 +20,9 @@
 -define(REM_VAL, removed).
 
 start_update(Partial, State, NumChanges, NumChangesDone) ->
+    start_update(Partial, State, NumChanges, NumChangesDone, nil).
+    
+start_update(Partial, State, NumChanges, NumChangesDone, EndSeq) ->
     MaxSize = config:get_integer("view_updater", "queue_memory_cap", 100000),
     MaxItems = config:get_integer("view_updater", "queue_item_cap", 500),
     QueueOpts = [{max_size, MaxSize}, {max_items, MaxItems}],
@@ -33,25 +36,35 @@ start_update(Partial, State, NumChanges, NumChangesDone) ->
         write_queue=WriteQueue
     },
 
-    Self = self(),
+    Category =
+    case EndSeq of
+        nil -> active;
+        _ -> chaser
+    end,
 
+    Progress = case NumChanges of
+        0 -> 0;
+        _ -> (NumChangesDone * 100) div NumChanges
+    end,
+    couch_task_status:add_task([
+        {indexer_pid, ?l2b(pid_to_list(Partial))},
+        {type, indexer},
+        {database, State#mrst.db_name},
+        {design_document, State#mrst.idx_name},
+        {progress, Progress},
+        {changes_done, NumChangesDone},
+        {suspended_on, 0},
+        {category, Category},
+        {seq, 0},
+        {resumed_on, 0},
+        {total_changes, NumChanges}
+    ]),
+    couch_task_status:set_update_frequency(500),
+    
+    Self = self(),
     MapFun = fun() ->
         erlang:put(io_priority,
             {view_update, State#mrst.db_name, State#mrst.idx_name}),
-        Progress = case NumChanges of
-            0 -> 0;
-            _ -> (NumChangesDone * 100) div NumChanges
-        end,
-        couch_task_status:add_task([
-            {indexer_pid, ?l2b(pid_to_list(Partial))},
-            {type, indexer},
-            {database, State#mrst.db_name},
-            {design_document, State#mrst.idx_name},
-            {progress, Progress},
-            {changes_done, NumChangesDone},
-            {total_changes, NumChanges}
-        ]),
-        couch_task_status:set_update_frequency(500),
         map_docs(Self, InitState)
     end,
     WriteFun = fun() ->
@@ -110,15 +123,44 @@ purge(_Db, PurgeSeq, PurgedIdRevs, State) ->
         purge_seq=PurgeSeq
     }}.
 
+cleanup_message_Q(Event) ->
+    receive Event -> cleanup_message_Q(Event) after 0 -> ok end.
 
-process_doc(Doc, Seq, #mrst{doc_acc=Acc}=State) when length(Acc) > 100 ->
+timestamp({Mega, Secs, _}) ->
+    Mega * 1000000 + Secs.
+
+suspend() ->
+    couch_task_status:set_update_frequency(0),
+    couch_task_status:update([{suspended_on, timestamp(now())}, {resumed_on, 0}]),
+    couch_task_status:set_update_frequency(500),
+    cleanup_message_Q(resume),
+    cleanup_message_Q(suspend),
+    receive resume -> ok end,
+    couch_task_status:set_update_frequency(0),
+    couch_task_status:update([{suspended_on, 0}, {resumed_on, timestamp(now())}]),
+    couch_task_status:set_update_frequency(500).
+
+process_doc(Doc, Seq, State) ->
+    receive
+        {update_task, NumChanges} ->
+            update_task(NumChanges, Seq),
+            process_doc(Doc, Seq, State);
+        suspend ->
+            suspend()
+        after 0 ->
+            ok
+    end,
+    cleanup_message_Q(resume),
+    process_doc_int(Doc, Seq, State).
+
+process_doc_int(Doc, Seq, #mrst{doc_acc=Acc}=State) when length(Acc) > 100 ->
     couch_work_queue:queue(State#mrst.doc_queue, lists:reverse(Acc)),
-    process_doc(Doc, Seq, State#mrst{doc_acc=[]});
-process_doc(nil, Seq, #mrst{doc_acc=Acc}=State) ->
+    process_doc_int(Doc, Seq, State#mrst{doc_acc=[]});
+process_doc_int(nil, Seq, #mrst{doc_acc=Acc}=State) ->
     {ok, State#mrst{doc_acc=[{nil, Seq, nil} | Acc]}};
-process_doc(#doc{id=Id, deleted=true}, Seq, #mrst{doc_acc=Acc}=State) ->
+process_doc_int(#doc{id=Id, deleted=true}, Seq, #mrst{doc_acc=Acc}=State) ->
     {ok, State#mrst{doc_acc=[{Id, Seq, deleted} | Acc]}};
-process_doc(#doc{id=Id}=Doc, Seq, #mrst{doc_acc=Acc}=State) ->
+process_doc_int(#doc{id=Id}=Doc, Seq, #mrst{doc_acc=Acc}=State) ->
     {ok, State#mrst{doc_acc=[{Id, Seq, Doc} | Acc]}}.
 
 
@@ -166,7 +208,7 @@ map_docs(Parent, #mrst{db_name = DbName, idx_name = IdxName} = State0) ->
                     {erlang:max(Seq, SeqAcc), [{Id, Res} | Results]}
             end,
             FoldFun = fun(Docs, Acc) ->
-                update_task(length(Docs)),
+                Parent ! {update_task, length(Docs)},
                 lists:foldl(DocFun, Acc, Docs)
             end,
             Results = lists:foldl(FoldFun, {0, []}, Dequeued),
@@ -350,9 +392,10 @@ send_partial(_, _) ->
     ok.
 
 
-update_task(NumChanges) ->
+update_task(NumChanges, Seq0) ->
     [Changes, Total] = couch_task_status:get([changes_done, total_changes]),
     Changes2 = Changes + NumChanges,
+    Seq2 = Seq0 + Changes2,
     Progress = case Total of
         0 ->
             % updater restart after compaction finishes
@@ -360,7 +403,7 @@ update_task(NumChanges) ->
         _ ->
             (Changes2 * 100) div Total
     end,
-    couch_task_status:update([{progress, Progress}, {changes_done, Changes2}]).
+    couch_task_status:update([{progress, Progress}, {changes_done, Changes2}, {seq, Seq2}]).
 
 
 maybe_notify(State, View, KVs, ToRem) ->

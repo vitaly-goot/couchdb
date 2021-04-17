@@ -126,9 +126,9 @@ compact(Idx, Mod, IdxState, Opts) ->
     end),
     ok = Mod:commit(NewIdxState),
     case gen_server:call(Idx, {compacted, NewIdxState}) of
-        recompact ->
+        {recompact, EndSeq} ->
             couch_log:info("Compaction restarting for db: ~s idx: ~s", Args),
-            compact(Idx, Mod, NewIdxState, [recompact]);
+            compact(Idx, Mod, NewIdxState, [{recompact, true}, {endseq, EndSeq}]);
         _ ->
             couch_log:info("Compaction finished for db: ~s idx: ~s", Args),
             ok

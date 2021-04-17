@@ -15,7 +15,7 @@
 
 -export([get/2]).
 -export([init/2, open/2, close/1, reset/1, delete/1, shutdown/1]).
--export([start_update/4, purge/4, process_doc/3, finish_update/1, commit/1]).
+-export([start_update/4, start_update/5, purge/4, process_doc/3, finish_update/1, commit/1]).
 -export([compact/3, swap_compacted/2, remove_compacted/1]).
 -export([index_file_exists/1]).
 -export([update_local_purge_doc/2, verify_index_exists/2]).
@@ -182,11 +182,15 @@ reset(State) ->
 
 
 start_update(PartialDest, State, NumChanges, NumChangesDone) ->
+    start_update(PartialDest, State, NumChanges, NumChangesDone, nil).
+
+start_update(PartialDest, State, NumChanges, NumChangesDone, EndSeq) ->
     couch_mrview_updater:start_update(
         PartialDest,
         State,
         NumChanges,
-        NumChangesDone
+        NumChangesDone,
+        EndSeq
     ).
 
 

@@ -151,7 +151,7 @@ handle_info_req(Req, _Db, _DDoc) ->
 handle_compact_req(#httpd{method='POST'}=Req, Db, DDoc) ->
     chttpd:validate_ctype(Req, "application/json"),
     ok = couch_db:check_is_admin(Db),
-    ok = couch_mrview:compact(Db, DDoc),
+    ok = couch_mrview:compact(Db, DDoc, couch_httpd:qs(Req)),
     chttpd:send_json(Req, 202, {[{ok, true}]});
 handle_compact_req(Req, _Db, _DDoc) ->
     chttpd:send_method_not_allowed(Req, "POST").

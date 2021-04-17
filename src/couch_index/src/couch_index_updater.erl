@@ -15,10 +15,10 @@
 
 
 %% API
--export([start_link/2, run/2, is_running/1, update/2, restart/2]).
+-export([start_link/2, run/2, is_running/1, suspend/2, update/2, restart/2]).
 
 %% for upgrades
--export([update/3]).
+-export([update/3, update/4]).
 
 %% gen_server callbacks
 -export([init/1, terminate/2, code_change/3]).
@@ -39,6 +39,10 @@ start_link(Index, Module) ->
 
 run(Pid, IdxState) ->
     gen_server:call(Pid, {update, IdxState}).
+
+
+suspend(Pid, IdxState) ->
+    gen_server:call(Pid, {suspend,IdxState}).
 
 
 is_running(Pid) ->
@@ -64,6 +68,7 @@ terminate(_Reason, State) ->
 
 
 handle_call({update, _IdxState}, _From, #st{pid=Pid}=State) when is_pid(Pid) ->
+    Pid ! resume,
     {reply, ok, State};
 handle_call({update, IdxState}, _From, #st{idx=Idx, mod=Mod}=State) ->
     Args = [Mod:get(db_name, IdxState), Mod:get(idx_name, IdxState)],
@@ -89,7 +94,10 @@ handle_call({restart, IdxState}, _From, #st{idx=Idx, mod=Mod}=State) ->
     {reply, ok, State#st{pid=NewPid}};
 handle_call(is_running, _From, #st{pid=Pid}=State) when is_pid(Pid) ->
     {reply, true, State};
-handle_call(is_running, _From, State) ->
+handle_call({suspend, IdxState}, _From, #st{pid=Pid}=State) when is_pid(Pid) ->
+    Pid ! suspend,
+    {reply, ok, State};
+handle_call(_Event, _From, State) ->
     {reply, false, State}.
 
 
@@ -127,6 +135,9 @@ code_change(_OldVsn, State, _Extra) ->
 
 
 update(Idx, Mod, IdxState) ->
+    update(Idx, Mod, IdxState, nil).
+
+update(Idx, Mod, IdxState, EndSeq) ->
     DbName = Mod:get(db_name, IdxState),
     IndexName = Mod:get(idx_name, IdxState),
     erlang:put(io_priority, {view_update, DbName, IndexName}),
@@ -189,24 +200,48 @@ update(Idx, Mod, IdxState) ->
                 Idx,
                 PurgedIdxState,
                 TotalChanges,
-                NumPurgeChanges
+                NumPurgeChanges,
+                EndSeq
             ),
 
+        EnumOptions =
+        case EndSeq of
+        nil ->
+            [];
+        _Else ->
+            [{end_key, EndSeq + 1}]
+        end,
+
         Acc0 = {InitIdxState, true},
-        {ok, Acc} = couch_db:fold_changes(Db, CurrSeq, Proc, Acc0, []),
+        {ok, Acc} = couch_db:fold_changes(Db, CurrSeq, Proc, Acc0, EnumOptions),
         {ProcIdxSt, SendLast} = Acc,
 
         % If we didn't bail due to hitting the last committed seq we need
         % to send our last update_seq through.
         {ok, LastIdxSt} = case SendLast of
-            true ->
+            true when EndSeq == nil; EndSeq >= DbUpdateSeq ->
                 Mod:process_doc(nil, DbUpdateSeq, ProcIdxSt);
             _ ->
                 {ok, ProcIdxSt}
         end,
 
         {ok, FinalIdxState} = Mod:finish_update(LastIdxSt),
-        exit({updated, self(), FinalIdxState})
+        % 04/12/2021 GVL
+        % handle the case when final_seq == start_seq while end_seq less than db_update_seq
+        % it might be that all documents in that range were purged 
+        % if we return like that we will be calling with the same start_seq,end_seq range again and again
+        % instead we just increase end_seq and retry with bigger range
+        case {CurrSeq, Mod:get(update_seq, FinalIdxState), DbUpdateSeq, EndSeq} of
+        {_,_,_,nil} ->
+            exit({updated, self(), FinalIdxState});
+        {F,F,U,E} when U > E ->
+            Delta = (EndSeq - CurrSeq) * 2,
+            EndSeq1 = CurrSeq + Delta,
+            couch_log:info("Unable to process any documents. Inreasing end range. ~p:~p + ~p~n", [CurrSeq,EndSeq,Delta]),
+            update(Idx, Mod, FinalIdxState, EndSeq1);
+        _ ->
+            exit({updated, self(), FinalIdxState})
+        end
     end).
 
 

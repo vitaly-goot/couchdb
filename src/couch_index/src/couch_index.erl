@@ -39,7 +39,8 @@
     compactor,
     waiters=[],
     committed=true,
-    shutdown=false
+    shutdown=false,
+    stickysuspend_indexer=false
 }).
 
 
@@ -69,7 +70,7 @@ compact(Pid) ->
 
 
 compact(Pid, Options) ->
-    {ok, CPid} = gen_server:call(Pid, compact),
+    {ok, CPid} = gen_server:call(Pid, {compact, Options}),
     case lists:member(monitor, Options) of
         true -> {ok, erlang:monitor(process, CPid)};
         false -> ok
@@ -148,7 +149,7 @@ handle_call({get_state, ReqSeq}, From, State) ->
         true ->
             {reply, {ok, IdxState}, State};
         _ -> % View update required
-            couch_index_updater:run(State#st.updater, IdxState),
+            maybe_restart_updater(State, verify_index_suspension),
             Waiters2 = [{From, ReqSeq} | Waiters],
             {noreply, State#st{waiters=Waiters2}, infinity}
     end;
@@ -177,27 +178,32 @@ handle_call(reset, _From, State) ->
     } = State,
     {ok, NewIdxState} = Mod:reset(IdxState),
     {reply, {ok, NewIdxState}, State#st{idx_state=NewIdxState}};
-handle_call(compact, _From, State) ->
+handle_call({compact, Options}, _From, State) ->
+    couch_index_updater:suspend(State#st.updater, State#st.idx_state),
     Resp = couch_index_compactor:run(State#st.compactor, State#st.idx_state),
-    {reply, Resp, State};
+    StickySuspendIndexer = list_to_atom(couch_util:get_value("stickysuspend_indexer", Options, "false")),
+    {reply, Resp, State#st{stickysuspend_indexer = StickySuspendIndexer}};
 handle_call(get_compactor_pid, _From, State) ->
     {reply, {ok, State#st.compactor}, State};
 handle_call({compacted, NewIdxState}, _From, State) ->
     #st{
         mod=Mod,
-        idx_state=OldIdxState
+        idx_state=OldIdxState,
+        stickysuspend_indexer=StickySuspendIndexer
     } = State,
     assert_signature_match(Mod, OldIdxState, NewIdxState),
     NewSeq = Mod:get(update_seq, NewIdxState),
     OldSeq = Mod:get(update_seq, OldIdxState),
+    NewPurgeSeq = Mod:get(purge_seq, NewIdxState),
+    OldPurgeSeq = Mod:get(purge_seq, OldIdxState),
     % For indices that require swapping files, we have to make sure we're
     % up to date with the current index. Otherwise indexes could roll back
     % (perhaps considerably) to previous points in history.
     case is_recompaction_enabled(NewIdxState, State) of
         true ->
-            case NewSeq >= OldSeq of
-                true -> {reply, ok, commit_compacted(NewIdxState, State)};
-                false -> {reply, recompact, State}
+            case {StickySuspendIndexer, NewPurgeSeq, OldPurgeSeq, NewSeq, OldSeq}  of
+                {A, B, C, D, E} when A, B >= C; D >= E -> {reply, ok, commit_compacted(NewIdxState, State)};
+                _ -> {reply, {recompact, max(NewSeq,OldSeq) + 10000}, State}
             end;
         false ->
             {reply, ok, commit_compacted(NewIdxState, State)}
@@ -222,7 +228,7 @@ handle_cast({trigger_update, UpdateSeq}, State) ->
         true ->
             {noreply, State};
         false ->
-            couch_index_updater:run(State#st.updater, IdxState),
+            maybe_restart_updater(State, verify_index_suspension),
             {noreply, State}
     end;
 handle_cast({updated, NewIdxState}, State) ->
@@ -231,7 +237,7 @@ handle_cast({updated, NewIdxState}, State) ->
         true ->
             {stop, normal, NewState};
         false ->
-            maybe_restart_updater(NewState),
+            maybe_restart_updater(NewState, verify_no_client),
             {noreply, NewState}
     end;
 handle_cast({new_state, NewIdxState}, State) ->
@@ -392,11 +398,12 @@ format_status(Opt, [PDict, State]) ->
         ?record_to_keyval(st, Scrubbed) ++ IdxSafeState
     }]}].
 
-maybe_restart_updater(#st{waiters=[]}) ->
+maybe_restart_updater(#st{waiters=[]}, verify_no_client) ->
     ok;
-maybe_restart_updater(#st{idx_state=IdxState}=State) ->
-    couch_index_updater:run(State#st.updater, IdxState).
-
+maybe_restart_updater(#st{updater=Updater, idx_state=IdxState, stickysuspend_indexer=SuspendFlag}=State, _) when is_pid(Updater), SuspendFlag /= true ->
+    couch_index_updater:run(Updater, IdxState);
+maybe_restart_updater(_,_) ->
+    ok.
 
 send_all(Waiters, Reply) ->
     [gen_server:reply(From, Reply) || {From, _} <- Waiters].
@@ -432,7 +439,8 @@ commit_compacted(NewIdxState, State) ->
     end,
     State#st{
         idx_state=NewIdxState1,
-        committed=false
+        committed=false,
+        stickysuspend_indexer=false
      }.
 
 is_recompaction_enabled(IdxState, #st{mod = Mod}) ->

@@ -29,9 +29,12 @@
 -define(DEFAULT_RECOMPACT_RETRY_COUNT, 3).
 
 compact(_Db, State, Opts) ->
-    case lists:member(recompact, Opts) of
-        false -> compact(State);
-        true -> recompact(State)
+    case couch_util:get_value(recompact, Opts, undefined) of
+    true ->
+        EndSeq = couch_util:get_value(endseq, Opts, nil),
+        recompact(State, EndSeq, recompact_retry_count());
+    _ ->
+        compact(State)
     end.
 
 compact(State) ->
@@ -122,34 +125,30 @@ compact(State) ->
         update_seq=Seq
     }}.
 
-
-recompact(State) ->
-    recompact(State, recompact_retry_count()).
-
-recompact(#mrst{db_name=DbName, idx_name=IdxName}, 0) ->
+recompact(#mrst{db_name=DbName, idx_name=IdxName}, _EndSeq, 0) ->
     erlang:error({exceeded_recompact_retry_count,
         [{db_name, DbName}, {idx_name, IdxName}]});
 
-recompact(State, RetryCount) ->
+recompact(State, EndSeq, RetryCount) ->
     Self = self(),
     link(State#mrst.fd),
     {Pid, Ref} = erlang:spawn_monitor(fun() ->
-        couch_index_updater:update(Self, couch_mrview_index, State)
+        couch_index_updater:update(Self, couch_mrview_index, State, EndSeq)
     end),
-    recompact_loop(Pid, Ref, State, RetryCount).
+    recompact_loop(Pid, Ref, State, EndSeq, RetryCount).
 
-recompact_loop(Pid, Ref, State, RetryCount) ->
+recompact_loop(Pid, Ref, State, EndSeq, RetryCount) ->
     receive
         {'$gen_cast', {new_state, State2}} ->
             % We've made progress so reset RetryCount
-            recompact_loop(Pid, Ref, State2, recompact_retry_count());
+            recompact_loop(Pid, Ref, State2, EndSeq, recompact_retry_count());
         {'DOWN', Ref, _, _, {updated, Pid, State2}} ->
             unlink(State#mrst.fd),
             {ok, State2};
         {'DOWN', Ref, _, _, Reason} ->
             unlink(State#mrst.fd),
             couch_log:warning("Error during recompaction: ~r", [Reason]),
-            recompact(State, RetryCount - 1)
+            recompact(State, EndSeq, RetryCount - 1)
     end.
 
 recompact_retry_count() ->
